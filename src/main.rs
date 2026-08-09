@@ -1,4 +1,7 @@
-use std::{io::Read, process::exit};
+use std::{
+    io::{BufReader, Read, Write, stdout},
+    process::exit,
+};
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum TokenKind {
@@ -22,7 +25,7 @@ struct Token {
 struct Program(Vec<Token>);
 
 impl std::ops::Deref for Program {
-    type Target = Vec<Token>;
+    type Target = [Token];
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -78,7 +81,7 @@ impl Machine {
     }
 
     fn step(&mut self) -> bool {
-        if self.ip >= self.program.len() - 1 {
+        if self.ip >= self.program.len() {
             return false;
         }
 
@@ -92,7 +95,8 @@ impl Machine {
             TokenKind::IncPtr => self.ptr += 1,
             TokenKind::DecPtr => {
                 if self.ptr == 0 {
-                    eprintln!("stack underflow");
+                    eprintln!("{}:{} tape underflow", c.line, c.col);
+                    exit(1);
                 }
                 self.ptr -= 1;
             }
@@ -111,12 +115,34 @@ impl Machine {
                 }
             }
             TokenKind::Output => {
-                print!("{}", self.data[self.ptr] as char);
+                let mut out = stdout();
+                let r = out
+                    .write_all(&[self.data[self.ptr]])
+                    .and_then(|_| out.flush());
+                if let Err(e) = r {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        exit(0);
+                    }
+                    eprintln!("{}:{} error writing to stdout: {}", c.line, c.col, e);
+                    exit(1);
+                }
             }
             TokenKind::Input => {
                 let mut buf = [0u8; 1];
-                let read = std::io::stdin().read(&mut buf).expect("read stdin");
-                if read != 0 {
+                let n = loop {
+                    match std::io::stdin().read(&mut buf) {
+                        Ok(n) => break n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            eprintln!("{}:{} error reading stdin: {}", c.line, c.col, e);
+                            exit(1);
+                        }
+                    }
+                };
+
+                if n == 0 {
+                    self.data[self.ptr] = 0;
+                } else {
                     self.data[self.ptr] = buf[0];
                 }
             }
@@ -126,7 +152,10 @@ impl Machine {
                     while balance != 0 {
                         self.ip += 1;
                         if self.program.len() <= self.ip {
-                            eprintln!("syntax error, matching bracket not found");
+                            eprintln!(
+                                "{}:{} syntax error, matching bracket not found",
+                                c.line, c.col
+                            );
                             exit(1);
                         }
 
@@ -145,11 +174,14 @@ impl Machine {
             TokenKind::LoopEnd => {
                 if let Some(loop_start) = self.loop_stack.pop() {
                     self.ip = loop_start;
-                } else {
-                    eprintln!("syntax error, matching bracket not found");
-                    exit(1);
+                    return true;
                 }
-                return true;
+
+                eprintln!(
+                    "{}:{} syntax error, matching bracket not found",
+                    c.line, c.col
+                );
+                exit(1);
             }
         }
         self.ip += 1;
@@ -165,40 +197,72 @@ impl Machine {
     }
 }
 
-fn parse(program: &str) -> Program {
-    let tokens = program
-        .lines()
-        .enumerate()
-        .flat_map(|(line, line_str)| {
-            line_str.chars().enumerate().filter_map(move |(col, c)| {
-                let kind = match c {
-                    '>' => Some(TokenKind::IncPtr),
-                    '<' => Some(TokenKind::DecPtr),
-                    '+' => Some(TokenKind::IncVal),
-                    '-' => Some(TokenKind::DecVal),
-                    '.' => Some(TokenKind::Output),
-                    ',' => Some(TokenKind::Input),
-                    '[' => Some(TokenKind::LoopStart),
-                    ']' => Some(TokenKind::LoopEnd),
-                    _ => None,
-                };
+fn parse<R: Read>(program: R) -> Program {
+    let buf = BufReader::new(program);
+    let (mut row, mut col) = (1, 1);
+    let mut tokens = Vec::new();
+    for byte_result in buf.bytes() {
+        let b = match byte_result {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error reading program file: {}", e);
+                exit(1);
+            }
+        };
 
-                kind.map(|kind| Token {
-                    kind,
-                    line: line + 1,
-                    col: col + 1,
-                })
-            })
-        })
-        .collect();
+        let kind = match b {
+            b'>' => Some(TokenKind::IncPtr),
+            b'<' => Some(TokenKind::DecPtr),
+            b'+' => Some(TokenKind::IncVal),
+            b'-' => Some(TokenKind::DecVal),
+            b'.' => Some(TokenKind::Output),
+            b',' => Some(TokenKind::Input),
+            b'[' => Some(TokenKind::LoopStart),
+            b']' => Some(TokenKind::LoopEnd),
+            _ => None,
+        };
+
+        if let Some(kind) = kind {
+            tokens.push(Token {
+                kind,
+                line: row,
+                col,
+            });
+        }
+
+        match b {
+            b'\n' => {
+                row += 1;
+                col = 1;
+            }
+            _ => {
+                col += 1;
+            }
+        };
+    }
 
     Program(tokens)
 }
 
 fn main() {
-    let program_path = std::env::args().nth(1).expect("no program path provided");
-    let program = std::fs::read_to_string(program_path).expect("could not read program file");
-    let program = parse(&program);
+    let program_path = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("no program path provided");
+        exit(1);
+    });
+    let file = std::fs::File::open(&program_path).unwrap_or_else(|e| {
+        eprintln!("error opening program file {}: {}", program_path, e);
+        exit(1);
+    });
+    let meta = file.metadata().unwrap_or_else(|e| {
+        eprintln!("error reading program file {}: {}", program_path, e);
+        exit(1);
+    });
+    if meta.is_dir() {
+        eprintln!("{} is a directory", program_path);
+        exit(1);
+    }
+
+    let program = parse(file);
     program.validate();
 
     let mut machine = Machine::new(program);
