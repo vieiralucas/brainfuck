@@ -1,0 +1,2 @@
+Prints letter d forever
+++++++++++[>++++++++++<-]>[.]>
